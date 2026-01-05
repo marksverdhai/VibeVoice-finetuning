@@ -1,4 +1,16 @@
 # train_vibevoice_lora.py
+
+# Apply Unsloth kernel optimizations early (before model loading)
+# These patch RMSNorm and CrossEntropy globally for ~10-20% speedup
+_UNSLOTH_KERNELS_ACTIVE = False
+try:
+    from unsloth.kernels import patch_rms_layernorm, patch_loss_functions
+    patch_rms_layernorm()
+    patch_loss_functions()
+    _UNSLOTH_KERNELS_ACTIVE = True
+except ImportError:
+    pass  # Unsloth not installed, skip kernel patches
+
 import logging
 import os
 from dataclasses import dataclass, field
@@ -17,7 +29,8 @@ from transformers import (
 )
 from transformers import TrainingArguments as HfTrainingArguments
 
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
+from transformers import BitsAndBytesConfig
 
 from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
@@ -26,6 +39,17 @@ from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 from data_vibevoice import VibeVoiceDataset, VibeVoiceCollator
 
 logger = logging.getLogger(__name__)
+
+def _is_trainable_dtype(param: torch.Tensor) -> bool:
+    """Check if a parameter has a dtype that supports gradients (not quantized)."""
+    return param.dtype in (torch.float32, torch.float16, torch.bfloat16)
+
+def _safe_set_requires_grad(param: torch.Tensor, requires_grad: bool = True) -> bool:
+    """Safely set requires_grad, skipping quantized parameters. Returns True if set."""
+    if _is_trainable_dtype(param):
+        param.requires_grad = requires_grad
+        return True
+    return False
 
 # ================== SAMPLE CALLBACK UTILS ==================
 
@@ -117,8 +141,16 @@ class ModelArguments:
     train_diffusion_head: bool = field(default=False, metadata={"help": "Train diffusion prediction head (full fine-tune)"})
     train_connectors: bool = field(default=False, metadata={"help": "Train acoustic/semantic connectors (full fine-tune)"})
     layers_to_freeze: Optional[str] = field(
-        default=None, 
+        default=None,
         metadata={"help": "Comma-separated indices of diffusion head layers to freeze (e.g., '0,1,5,7,8')."}
+    )
+    use_qlora: bool = field(
+        default=False,
+        metadata={"help": "Use QLoRA (4-bit quantized base model with LoRA adapters). Saves ~50% VRAM."}
+    )
+    use_unsloth: bool = field(
+        default=False,
+        metadata={"help": "Use Unsloth for 2-5x faster training. Requires unsloth package."}
     )
 
 @dataclass
@@ -233,6 +265,8 @@ def main() -> None:
         level=logging.INFO if training_args.local_rank in [-1, 0] else logging.WARN,
     )
     logger.info("Training/evaluation parameters %s", training_args)
+    if _UNSLOTH_KERNELS_ACTIVE:
+        logger.info("Unsloth kernel optimizations ACTIVE (RMSNorm + CrossEntropy)")
     set_seed(training_args.seed)
 
     # Configure gradient clipping
@@ -265,10 +299,32 @@ def main() -> None:
         dtype = torch.bfloat16
     elif getattr(training_args, "fp16", False):
         dtype = torch.float16
+
+    # QLoRA: 4-bit quantization config
+    quantization_config = None
+    if model_args.use_qlora:
+        logger.info("Using QLoRA with 4-bit NF4 quantization")
+        # Skip quantization for modules that need to be trained in full precision
+        skip_modules = ["prediction_head", "acoustic_connector", "semantic_connector", "lm_head"]
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            llm_int8_skip_modules=skip_modules,  # Also works for 4-bit
+        )
+        logger.info(f"Skipping quantization for: {skip_modules}")
+
     model = VibeVoiceForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path,
         torch_dtype=dtype,
+        quantization_config=quantization_config,
+        device_map="auto" if model_args.use_qlora else None,
     )
+
+    # Prepare for k-bit training if using QLoRA
+    if model_args.use_qlora:
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
     _patch_acoustic_encode_for_legacy_indexing(model, logger)
     processor.semantic_tokenizer = getattr(model.model, "semantic_tokenizer", None)
 
@@ -378,7 +434,55 @@ def main() -> None:
     tm_lower = [s.strip().lower() for s in model_args.lora_target_modules.split(",") if s.strip()]
     skip_lm_lora = (len(tm_lower) == 0) or all(t in ("none", "off", "disable", "disabled") for t in tm_lower)
     if not skip_lm_lora:
-        model.model.language_model = get_peft_model(model.model.language_model, lora_cfg)
+        use_unsloth_success = False
+        if model_args.use_unsloth:
+            # Check if language_model is compatible with Unsloth (needs ForCausalLM wrapper)
+            lm_class_name = type(model.model.language_model).__name__
+            if "ForCausalLM" not in lm_class_name:
+                logger.warning(f"Unsloth requires *ForCausalLM model, got {lm_class_name}. Using standard PEFT LoRA.")
+            else:
+                try:
+                    from unsloth import FastLanguageModel
+                    target_modules = [s.strip() for s in model_args.lora_target_modules.split(",") if s.strip()]
+                    model.model.language_model = FastLanguageModel.get_peft_model(
+                        model.model.language_model,
+                        r=model_args.lora_r,
+                        target_modules=target_modules,
+                        lora_alpha=model_args.lora_alpha,
+                        lora_dropout=model_args.lora_dropout,
+                        bias="none",
+                        use_gradient_checkpointing="unsloth",
+                        random_state=training_args.seed,
+                        max_seq_length=2048,
+                    )
+                    logger.info(f"Applied Unsloth LoRA: r={model_args.lora_r}, alpha={model_args.lora_alpha}")
+                    use_unsloth_success = True
+                except ImportError:
+                    logger.warning("Unsloth not installed, falling back to standard PEFT LoRA")
+                except Exception as e:
+                    logger.warning(f"Unsloth LoRA failed ({e}), falling back to standard PEFT LoRA")
+
+        if not use_unsloth_success:
+            # Use standard PEFT LoRA - change task_type for non-CausalLM architectures
+            lm_class_name = type(model.model.language_model).__name__
+            if "ForCausalLM" not in lm_class_name:
+                # Use FEATURE_EXTRACTION for backbone models without generate()
+                lora_cfg_adjusted = LoraConfig(
+                    r=model_args.lora_r,
+                    lora_alpha=model_args.lora_alpha,
+                    lora_dropout=model_args.lora_dropout,
+                    bias="none",
+                    task_type=TaskType.FEATURE_EXTRACTION,
+                    target_modules=[s.strip() for s in model_args.lora_target_modules.split(",") if s.strip()],
+                )
+                model.model.language_model = get_peft_model(model.model.language_model, lora_cfg_adjusted)
+                logger.info(f"Applied PEFT LoRA (FEATURE_EXTRACTION) for backbone: {lm_class_name}")
+            else:
+                model.model.language_model = get_peft_model(model.model.language_model, lora_cfg)
+        # Mark top-level model as having PEFT adapters so Trainer allows QLoRA training
+        model._hf_peft_config_loaded = True
+        model.peft_config = model.model.language_model.peft_config
+        logger.info("Set _hf_peft_config_loaded=True on top-level model for QLoRA Trainer compatibility")
     else:
         logger.info("Skipping LLM LoRA wrapping (lora_target_modules indicates none).")
 
@@ -394,7 +498,7 @@ def main() -> None:
     try:
         for n, p in model.model.language_model.named_parameters():
             if "lora_A" in n or "lora_B" in n:
-                p.requires_grad = True
+                _safe_set_requires_grad(p, True)
     except Exception:
         logger.warning("Could not re-enable LoRA params on language_model.")
 
@@ -415,14 +519,20 @@ def main() -> None:
             model.model.prediction_head = get_peft_model(shim, build_head_lora_config(model_args))
             for n, p in model.model.prediction_head.named_parameters():
                 if "lora_A" in n or "lora_B" in n:
-                    p.requires_grad = True
+                    _safe_set_requires_grad(p, True)
         except Exception as e:
             logger.warning(f"Could not LoRA-wrap diffusion head: {e}")
 
     # Train full diffusion head (optional)
     if getattr(model_args, "train_diffusion_head", False) and hasattr(model.model, "prediction_head"):
+        trainable_count = 0
+        skipped_count = 0
         for p in model.model.prediction_head.parameters():
-            p.requires_grad = True
+            if _safe_set_requires_grad(p, True):
+                trainable_count += 1
+            else:
+                skipped_count += 1
+        logger.info(f"Diffusion head: {trainable_count} trainable params, {skipped_count} skipped (quantized)")
 
     # Freeze diffusion head layers (optional)
     if model_args.layers_to_freeze is not None and hasattr(model.model, "prediction_head"):
@@ -444,10 +554,10 @@ def main() -> None:
     if getattr(model_args, "train_connectors", False):
         if hasattr(model.model, "acoustic_connector"):
             for p in model.model.acoustic_connector.parameters():
-                p.requires_grad = True
+                _safe_set_requires_grad(p, True)
         if hasattr(model.model, "semantic_connector"):
             for p in model.model.semantic_connector.parameters():
-                p.requires_grad = True
+                _safe_set_requires_grad(p, True)
     else:
         if hasattr(model.model, "acoustic_connector"):
             for p in model.model.acoustic_connector.parameters():

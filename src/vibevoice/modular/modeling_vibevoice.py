@@ -354,8 +354,9 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         ) -> Union[Tuple, VibeVoiceCausalLMOutputWithPast]:
         
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
-        x = self.get_input_embeddings()(input_ids)
+
+        # Clone to allow in-place modifications without affecting the leaf variable
+        x = self.get_input_embeddings()(input_ids).clone()
 
         semantic_speech_all_connect_features = self.model.semantic_connector(speech_semantic_tensors)
         if speeches_loss_input is not None:
@@ -368,9 +369,11 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
                 )
             if speech_tensors is not None:
                 if semantic_speech_all_connect_features is not None:
-                    x[acoustic_input_mask] = speech_all_connect_features[speech_masks] + semantic_speech_all_connect_features[speech_masks]
+                    # Cast to match x's dtype to avoid dtype mismatch with QLoRA
+                    combined = speech_all_connect_features[speech_masks] + semantic_speech_all_connect_features[speech_masks]
+                    x[acoustic_input_mask] = combined.to(x.dtype)
                 else:
-                    x[acoustic_input_mask] = speech_all_connect_features[speech_masks]
+                    x[acoustic_input_mask] = speech_all_connect_features[speech_masks].to(x.dtype)
                 speech_features = speech_all_features[speeches_loss_input & speech_masks] # only part audio need diffuse
                 speech_connect_features = speech_all_connect_features[speeches_loss_input & speech_masks]
                 # Forward-time consistency check: selected latent count should match number of acoustic placeholders

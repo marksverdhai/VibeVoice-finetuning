@@ -411,6 +411,9 @@ class VibeVoiceProcessor:
             if isinstance(speaker_audio, str):
                 # Load audio from file
                 wav = self.audio_processor._load_audio_from_path(speaker_audio)
+            elif isinstance(speaker_audio, dict):
+                # Handle dict format from newer datasets library
+                wav = np.array(speaker_audio['array'], dtype=np.float32)
             else:
                 wav = np.array(speaker_audio, dtype=np.float32)
             
